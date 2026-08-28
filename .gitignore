@@ -1,0 +1,20 @@
+# nRF Connect SDK / Zephyr build trees
+build/
+**/build/
+
+# Generated images and maps
+*.hex
+*.map
+*.elf
+*.bin
+*.stat
+
+# Editor / OS
+.cache/
+.west/
+*.pyc
+__pycache__/
+.DS_Store
+Thumbs.db
+*.swp
+*~
