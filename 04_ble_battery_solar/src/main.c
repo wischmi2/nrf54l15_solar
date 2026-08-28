@@ -15,6 +15,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/led.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/sensor/npm13xx_charger.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -26,7 +27,9 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-#define CHARGER_NODE DT_NODELABEL(npm1300_charger)
+#define CHARGER_NODE    DT_NODELABEL(npm1300_charger)
+#define PMIC_LED_NODE   DT_NODELABEL(npm1300_leds)
+#define STATUS_LED_IDX  0
 
 #define CHG_STATUS_BATTERY_DETECTED BIT(0)
 #define CHG_STATUS_COMPLETE         BIT(1)
@@ -42,6 +45,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define VBAT_FULL_MV  4200
 
 static const struct device *charger = DEVICE_DT_GET(CHARGER_NODE);
+static const struct device *status_led = DEVICE_DT_GET(PMIC_LED_NODE);
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -97,11 +101,13 @@ static bool vbus_present(void)
 {
 	struct sensor_value val = {0};
 
-	if (sensor_attr_get(charger, SENSOR_CHAN_CURRENT,
-			    SENSOR_ATTR_UPPER_THRESH, &val) < 0) {
+	if (sensor_attr_get(charger,
+			    (enum sensor_channel)SENSOR_CHAN_NPM13XX_CHARGER_VBUS_STATUS,
+			    (enum sensor_attribute)SENSOR_ATTR_NPM13XX_CHARGER_VBUS_PRESENT,
+			    &val) < 0) {
 		return false;
 	}
-	return (val.val1 != 0) || (val.val2 != 0);
+	return val.val1 != 0;
 }
 
 static void read_pmic(struct solar_status *s)
@@ -123,6 +129,23 @@ static void read_pmic(struct solar_status *s)
 	s->ibat_ma = (int16_t)(ibat_f * 1000.0f);
 	s->charge_state = (uint8_t)decode_state(chg.val1);
 	s->battery_pct = soc_from_mv(s->vbat_mv);
+}
+
+static void status_led_update(const struct solar_status *s)
+{
+	bool charging = (s->charge_state == SOLAR_CHG_TRICKLE) ||
+			(s->charge_state == SOLAR_CHG_CC) ||
+			(s->charge_state == SOLAR_CHG_CV);
+
+	if (!device_is_ready(status_led)) {
+		return;
+	}
+
+	if (charging) {
+		led_on(status_led, STATUS_LED_IDX);
+	} else {
+		led_off(status_led, STATUS_LED_IDX);
+	}
 }
 
 static void on_connected(struct bt_conn *conn, uint8_t err)
@@ -178,6 +201,7 @@ int main(void)
 
 		bt_bas_set_battery_level(s.battery_pct);
 		solar_service_update(&s);
+		status_led_update(&s);
 
 		LOG_INF("VBAT %u mV (%u%%) | I %d mA | %s | VBUS %s",
 			s.vbat_mv, s.battery_pct, s.ibat_ma,

@@ -57,6 +57,21 @@
 };
 
 /*
+ * FM8625H antenna switch (VDD = BUCK1 / VOUT1 = 1.8 V):
+ *   VCTL low  -> ANT to RF1 -> chip antenna (2450AT18A100E)
+ *   VCTL high -> ANT to RF2 -> ECT818000500 connector
+ * ANT_SEL = P0.01 (QFN pin 24). Hold low for the onboard antenna.
+ */
+&gpio0 {
+	ant_sel_hog {
+		gpio-hog;
+		gpios = <1 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "ANT_SEL";
+	};
+};
+
+/*
  * nRF54L15 DK board files enable the 32.768 kHz LFXO. This custom board
  * does not have that crystal, so GRTC init waits forever and main() never
  * runs. Use the internal LF RC instead.
@@ -158,15 +173,16 @@
 		 * 0/1/2 through the LED API (e.g. led_on(dev, 0)). There are no
 		 * child nodes.
 		 *
-		 * LED0 = board status LED -> "host" so firmware drives it.
-		 * Change led0 to "charging" to make it a zero-firmware hardware
-		 * charge indicator instead.
+		 * LED0 = board status LED (VSYS -> R14 -> nPM1300 pin 25).
+		 * "host" so firmware turns it on only while actually charging
+		 * (USB in). Unplug USB -> idle -> LED off, even if solar still
+		 * ticks VBUS-present at ~4 V.
 		 */
 		npm1300_leds: leds {
 			compatible = "nordic,npm1300-led";
 			nordic,led0-mode = "host";
 			nordic,led1-mode = "error";
-			nordic,led2-mode = "charging";
+			nordic,led2-mode = "host";
 		};
 	};
 };
