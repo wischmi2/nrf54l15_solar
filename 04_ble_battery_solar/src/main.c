@@ -5,6 +5,10 @@
  * Bluetooth Battery Service (battery %), and publishes a custom service with
  * battery voltage, charge current, charge state, and VBUS/solar presence.
  *
+ * LED0: solid while trickle/CC/CV; three blinks every 7 s while a phone is
+ * connected; one 200 ms heartbeat every 2 s while advertising (after
+ * disconnect or at boot); one blink every 5 s when full if not advertising.
+ *
  * Test with "nRF Connect for Mobile":
  *   - Scan for "Nordic_Solar", connect.
  *   - Battery Service shows the level; the custom service (UUID 5c1b0000-...)
@@ -14,6 +18,7 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/led.h>
 #include <zephyr/drivers/sensor.h>
@@ -44,8 +49,39 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define VBAT_EMPTY_MV 3300
 #define VBAT_FULL_MV  4200
 
+/* LED0 patterns. Charging (solid) wins, then connected, then advertising. */
+#define LED_BLINK_ON_MS       200
+#define LED_BLINK_GAP_MS      200
+#define LED_FULL_BURST        1
+#define LED_FULL_PERIOD_MS    5000
+#define LED_HB_BURST          1
+#define LED_HB_PERIOD_MS      2000
+#define LED_CONN_BURST        3
+#define LED_CONN_PERIOD_MS    7000
+
+enum status_led_mode {
+	LED_MODE_OFF,
+	LED_MODE_SOLID,
+	LED_MODE_BLINK_FULL,
+	LED_MODE_BLINK_HB,
+	LED_MODE_BLINK_CONN,
+};
+
 static const struct device *charger = DEVICE_DT_GET(CHARGER_NODE);
 static const struct device *status_led = DEVICE_DT_GET(PMIC_LED_NODE);
+static enum status_led_mode led_mode = LED_MODE_OFF;
+static struct solar_status led_status;
+static atomic_t ble_connected;
+static atomic_t ble_advertising;
+static uint8_t blink_burst;
+static uint8_t blinks_remaining;
+static uint32_t blink_period_ms;
+static void led_blink_on_fn(struct k_work *work);
+static void led_blink_off_fn(struct k_work *work);
+static void led_refresh_fn(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(led_blink_on_work, led_blink_on_fn);
+static K_WORK_DELAYABLE_DEFINE(led_blink_off_work, led_blink_off_fn);
+static K_WORK_DEFINE(led_refresh_work, led_refresh_fn);
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -131,40 +167,227 @@ static void read_pmic(struct solar_status *s)
 	s->battery_pct = soc_from_mv(s->vbat_mv);
 }
 
-static void status_led_update(const struct solar_status *s)
+static bool led_is_blinking(enum status_led_mode mode)
 {
-	bool charging = (s->charge_state == SOLAR_CHG_TRICKLE) ||
-			(s->charge_state == SOLAR_CHG_CC) ||
-			(s->charge_state == SOLAR_CHG_CV);
+	return (mode == LED_MODE_BLINK_FULL) ||
+	       (mode == LED_MODE_BLINK_HB) ||
+	       (mode == LED_MODE_BLINK_CONN);
+}
 
+static bool led_charge_active(uint8_t chg)
+{
+	return (chg == SOLAR_CHG_TRICKLE) ||
+	       (chg == SOLAR_CHG_CC) ||
+	       (chg == SOLAR_CHG_CV);
+}
+
+static enum status_led_mode led_desired_mode(void)
+{
+	uint8_t chg = led_status.charge_state;
+
+	if (led_charge_active(chg)) {
+		return LED_MODE_SOLID;
+	}
+	if (atomic_get(&ble_connected)) {
+		return LED_MODE_BLINK_CONN;
+	}
+	if (atomic_get(&ble_advertising)) {
+		return LED_MODE_BLINK_HB;
+	}
+	/* COMPLETE can drop to IDLE while VBUS is still in and the cell is
+	 * full. Fallback if advertising is not running.
+	 */
+	if ((chg == SOLAR_CHG_COMPLETE) ||
+	    (led_status.vbus_present && (chg == SOLAR_CHG_IDLE))) {
+		return LED_MODE_BLINK_FULL;
+	}
+	return LED_MODE_OFF;
+}
+
+static void led_apply(bool on)
+{
 	if (!device_is_ready(status_led)) {
 		return;
 	}
 
-	if (charging) {
+	if (on) {
 		led_on(status_led, STATUS_LED_IDX);
 	} else {
 		led_off(status_led, STATUS_LED_IDX);
 	}
 }
 
+static void led_blink_stop(void)
+{
+	(void)k_work_cancel_delayable(&led_blink_on_work);
+	(void)k_work_cancel_delayable(&led_blink_off_work);
+}
+
+static void led_blink_on_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!led_is_blinking(led_mode)) {
+		return;
+	}
+
+	led_apply(true);
+	k_work_schedule(&led_blink_off_work, K_MSEC(LED_BLINK_ON_MS));
+}
+
+static void led_blink_off_fn(struct k_work *work)
+{
+	uint32_t used_ms;
+	uint32_t rest_ms;
+
+	ARG_UNUSED(work);
+
+	if (!led_is_blinking(led_mode)) {
+		return;
+	}
+
+	led_apply(false);
+
+	if (blinks_remaining > 0) {
+		blinks_remaining--;
+	}
+
+	if (blinks_remaining > 0) {
+		k_work_schedule(&led_blink_on_work, K_MSEC(LED_BLINK_GAP_MS));
+		return;
+	}
+
+	blinks_remaining = blink_burst;
+	used_ms = (uint32_t)blink_burst * LED_BLINK_ON_MS;
+	if (blink_burst > 0) {
+		used_ms += (uint32_t)(blink_burst - 1) * LED_BLINK_GAP_MS;
+	}
+	rest_ms = (blink_period_ms > used_ms) ? (blink_period_ms - used_ms) : 0;
+	k_work_schedule(&led_blink_on_work, K_MSEC(rest_ms));
+}
+
+static void led_refresh_fn(struct k_work *work)
+{
+	enum status_led_mode mode = led_desired_mode();
+
+	ARG_UNUSED(work);
+
+	if (mode == led_mode) {
+		return;
+	}
+
+	led_mode = mode;
+	led_blink_stop();
+	LOG_INF("LED mode %s",
+		mode == LED_MODE_SOLID ? "solid-charging" :
+		mode == LED_MODE_BLINK_FULL ? "blink-full" :
+		mode == LED_MODE_BLINK_HB ? "heartbeat" :
+		mode == LED_MODE_BLINK_CONN ? "blink-connected" : "off");
+
+	switch (mode) {
+	case LED_MODE_SOLID:
+		led_apply(true);
+		break;
+	case LED_MODE_BLINK_FULL:
+		blink_burst = LED_FULL_BURST;
+		blink_period_ms = LED_FULL_PERIOD_MS;
+		blinks_remaining = blink_burst;
+		led_blink_on_fn(NULL);
+		break;
+	case LED_MODE_BLINK_HB:
+		blink_burst = LED_HB_BURST;
+		blink_period_ms = LED_HB_PERIOD_MS;
+		blinks_remaining = blink_burst;
+		led_blink_on_fn(NULL);
+		break;
+	case LED_MODE_BLINK_CONN:
+		blink_burst = LED_CONN_BURST;
+		blink_period_ms = LED_CONN_PERIOD_MS;
+		blinks_remaining = blink_burst;
+		led_blink_on_fn(NULL);
+		break;
+	default:
+		led_apply(false);
+		break;
+	}
+}
+
+static void status_led_update(const struct solar_status *s)
+{
+	led_status = *s;
+	(void)k_work_submit(&led_refresh_work);
+}
+
+static void status_led_set_connected(bool connected)
+{
+	atomic_set(&ble_connected, connected ? 1 : 0);
+	(void)k_work_submit(&led_refresh_work);
+}
+
+static int start_advertising(void)
+{
+	int ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
+				  NULL, 0);
+
+	if (ret && ret != -EALREADY) {
+		atomic_set(&ble_advertising, 0);
+		LOG_ERR("advertising start failed (%d)", ret);
+		(void)k_work_submit(&led_refresh_work);
+		return ret;
+	}
+	atomic_set(&ble_advertising, 1);
+	(void)k_work_submit(&led_refresh_work);
+	LOG_INF("Advertising as \"%s\"", CONFIG_BT_DEVICE_NAME);
+	return 0;
+}
+
+/* NCS 3.x: do not call bt_le_adv_start() from disconnected — the conn
+ * object is still held (CONFIG_BT_MAX_CONN=1 -> -ENOMEM). Wait for
+ * .recycled, then start from a work item (callback is ISR-like).
+ */
+static void adv_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	(void)start_advertising();
+}
+
+static K_WORK_DEFINE(adv_work, adv_work_handler);
+
+static void request_advertising(void)
+{
+	(void)k_work_submit(&adv_work);
+}
+
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
 		LOG_ERR("connection failed (0x%02x)", err);
+		request_advertising();
 		return;
 	}
 	LOG_INF("BLE connected");
+	atomic_set(&ble_advertising, 0);
+	status_led_set_connected(true);
 }
 
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	ARG_UNUSED(conn);
 	LOG_INF("BLE disconnected (0x%02x)", reason);
+	/* Heartbeat immediately; recycled will restart advertising. */
+	atomic_set(&ble_advertising, 1);
+	status_led_set_connected(false);
+}
+
+static void on_recycled(void)
+{
+	request_advertising();
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = on_connected,
 	.disconnected = on_disconnected,
+	.recycled = on_recycled,
 };
 
 int main(void)
@@ -186,15 +409,7 @@ int main(void)
 	}
 	LOG_INF("Bluetooth initialized");
 
-	/* BT_LE_ADV_CONN_FAST_1 is the current connectable-advertising preset.
-	 * On an older SDK where it is not defined, use BT_LE_ADV_CONN instead.
-	 */
-	ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), NULL, 0);
-	if (ret) {
-		LOG_ERR("advertising start failed (%d)", ret);
-		return ret;
-	}
-	LOG_INF("Advertising as \"%s\"", CONFIG_BT_DEVICE_NAME);
+	request_advertising();
 
 	while (1) {
 		read_pmic(&s);

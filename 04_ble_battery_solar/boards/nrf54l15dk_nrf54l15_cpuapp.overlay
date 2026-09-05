@@ -60,13 +60,13 @@
  * FM8625H antenna switch (VDD = BUCK1 / VOUT1 = 1.8 V):
  *   VCTL low  -> ANT to RF1 -> chip antenna (2450AT18A100E)
  *   VCTL high -> ANT to RF2 -> ECT818000500 connector
- * ANT_SEL = P0.01 (QFN pin 24). Hold low for the onboard antenna.
+ * ANT_SEL = P0.01 (QFN pin 24). Hold high for the ECT818000500 connector.
  */
 &gpio0 {
 	ant_sel_hog {
 		gpio-hog;
 		gpios = <1 GPIO_ACTIVE_HIGH>;
-		output-low;
+		output-high;
 		line-name = "ANT_SEL";
 	};
 };
@@ -174,9 +174,10 @@
 		 * child nodes.
 		 *
 		 * LED0 = board status LED (VSYS -> R14 -> nPM1300 pin 25).
-		 * "host" so firmware turns it on only while actually charging
-		 * (USB in). Unplug USB -> idle -> LED off, even if solar still
-		 * ticks VBUS-present at ~4 V.
+		 * "host" so firmware can drive: solid while charging (trickle/
+		 * CC/CV), three blinks every 7 s while BLE is connected, a
+		 * 2 s heartbeat while advertising, one blink every 5 s when
+		 * COMPLETE if not advertising, off otherwise.
 		 */
 		npm1300_leds: leds {
 			compatible = "nordic,npm1300-led";
