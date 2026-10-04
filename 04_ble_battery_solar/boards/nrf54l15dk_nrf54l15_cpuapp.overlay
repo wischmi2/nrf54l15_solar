@@ -174,10 +174,8 @@
 		 * child nodes.
 		 *
 		 * LED0 = board status LED (VSYS -> R14 -> nPM1300 pin 25).
-		 * "host" so firmware can drive: solid while charging (trickle/
-		 * CC/CV), three blinks every 7 s while BLE is connected, a
-		 * 2 s heartbeat while advertising, one blink every 5 s when
-		 * COMPLETE if not advertising, off otherwise.
+		 * "host": solid as a bench load; 1 Hz blink while AEM
+		 * is charging the cell (no VBUS, IBAT > 0).
 		 */
 		npm1300_leds: leds {
 			compatible = "nordic,npm1300-led";
